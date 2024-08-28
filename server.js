@@ -4,6 +4,8 @@ const cors = require('cors');
 const admin = require('firebase-admin');
 const serviceAccount = require('./firebase-admin-json.json');
 const multer = require('multer');
+require('dotenv').config();
+const axios = require('axios');
 
 const app = express();
 app.use(express.json());
@@ -56,7 +58,8 @@ const athleteSchema = new mongoose.Schema({
       coachId: { type: mongoose.Schema.Types.ObjectId, ref: 'Coach', required: true },
       coachName: { type: String, required: true },
       coachEmail: { type: String, required: true },
-      channelId: { type: String, required: true },
+      zoomMeetingId: { type: String, required: true },
+      zoomJoinUrl: { type: String, required: true },
       bookingTimestamp: { type: Date, required: true },
       bookingDate: { type: String, required: true },
       startTime: { type: String, required: true },
@@ -138,7 +141,8 @@ const coachSchema = new mongoose.Schema({
   bookings: [
     {
       athleteId: { type: mongoose.Schema.Types.ObjectId, ref: 'Athlete', required: true },
-      channelId: { type: String, required: true },
+      zoomMeetingId: { type: String, required: true },
+      zoomJoinUrl: { type: String, required: true },
       bookingTimestamp: { type: Date, required: true },
       bookingDate: { type: String, required: true },
       startTime: { type: String, required: true },
@@ -206,42 +210,114 @@ app.put('/api/athletes/:id', upload.single('profileImage'), async (req, res) => 
     const { id } = req.params;
     const updatedData = req.body;
 
+    let athlete;
+
     if (req.file) {
+      // Handle profile image upload
       const blob = bucket.file(req.file.originalname);
       const blobWriter = blob.createWriteStream();
+      
       blobWriter.on('error', (err) => {
         console.error('Error uploading image:', err);
-        res.status(500).json({ error: 'An error occurred' });
+        res.status(500).json({ error: 'An error occurred during image upload' });
       });
+
       blobWriter.on('finish', async () => {
         const publicUrl = `https://storage.googleapis.com/${bucket.name}/${blob.name}`;
         updatedData.profileImage = publicUrl;
-        
-        const athlete = await Athlete.findByIdAndUpdate(
+
+        // Process bookings and create Zoom meeting if necessary
+        if (updatedData.bookings && updatedData.bookings.length > 0) {
+          const lastBooking = updatedData.bookings[updatedData.bookings.length - 1];
+          const zoomMeeting = await createZoomMeeting(
+            `Session with ${lastBooking.coachName}`,
+            `${lastBooking.bookingDate}T${lastBooking.startTime}:00`,
+            60 // Duration in minutes
+          );
+          lastBooking.zoomMeetingId = zoomMeeting.id;
+          lastBooking.zoomJoinUrl = zoomMeeting.join_url;
+
+          // Update coach's bookings
+          await Coach.findByIdAndUpdate(
+            lastBooking.coachId,
+            {
+              $push: {
+                bookings: {
+                  athleteId: id,
+                  zoomMeetingId: zoomMeeting.id,
+                  zoomJoinUrl: zoomMeeting.join_url,
+                  bookingTimestamp: lastBooking.bookingTimestamp,
+                  bookingDate: lastBooking.bookingDate,
+                  startTime: lastBooking.startTime,
+                  endTime: lastBooking.endTime,
+                }
+              }
+            }
+          );
+        }
+
+        // Update athlete data
+        athlete = await Athlete.findByIdAndUpdate(
           id,
           { $set: updatedData },
           { new: true }
         );
+
         if (!athlete) {
           return res.status(404).json({ error: 'Athlete not found' });
         }
+
         res.json(athlete);
       });
+
       blobWriter.end(req.file.buffer);
     } else {
-      const athlete = await Athlete.findByIdAndUpdate(
+      // No new profile image, just update other data
+      if (updatedData.bookings && updatedData.bookings.length > 0) {
+        const lastBooking = updatedData.bookings[updatedData.bookings.length - 1];
+        const zoomMeeting = await createZoomMeeting(
+          `Session with ${lastBooking.coachName}`,
+          `${lastBooking.bookingDate}T${lastBooking.startTime}:00`,
+          60 // Duration in minutes
+        );
+        lastBooking.zoomMeetingId = zoomMeeting.id;
+        lastBooking.zoomJoinUrl = zoomMeeting.join_url;
+
+        // Update coach's bookings
+        await Coach.findByIdAndUpdate(
+          lastBooking.coachId,
+          {
+            $push: {
+              bookings: {
+                athleteId: id,
+                zoomMeetingId: zoomMeeting.id,
+                zoomJoinUrl: zoomMeeting.join_url,
+                bookingTimestamp: lastBooking.bookingTimestamp,
+                bookingDate: lastBooking.bookingDate,
+                startTime: lastBooking.startTime,
+                endTime: lastBooking.endTime,
+              }
+            }
+          }
+        );
+      }
+
+      // Update athlete data
+      athlete = await Athlete.findByIdAndUpdate(
         id,
         { $set: updatedData },
         { new: true }
       );
+
       if (!athlete) {
         return res.status(404).json({ error: 'Athlete not found' });
       }
+
       res.json(athlete);
     }
   } catch (error) {
     console.error('Error updating athlete data:', error);
-    res.status(500).json({ error: 'An error occurred' });
+    res.status(500).json({ error: 'An error occurred', details: error.message });
   }
 });
 
@@ -377,13 +453,35 @@ app.get('/api/coaches/:id/availability', async (req, res) => {
   }
 });
 
-function generateChannelId() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  let result = '';
-  for (let i = 0; i < 10; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
+async function createZoomMeeting(topic, start_time, duration) {
+  try {
+    const response = await axios.post('https://api.zoom.us/v2/users/me/meetings', {
+      topic,
+      type: 2, // Scheduled meeting
+      start_time,
+      duration,
+      timezone: 'UTC',
+      settings: {
+        host_video: true,
+        participant_video: true,
+        join_before_host: false,
+        mute_upon_entry: true,
+        watermark: false,
+        use_pmi: false,
+        approval_type: 0,
+        audio: 'both',
+        auto_recording: 'none'
+      }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${process.env.TOKEN}`
+      }
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Error creating Zoom meeting:', error);
+    throw error;
   }
-  return result;
 }
 
 // Start the server
